@@ -48,6 +48,11 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
     ),
+    "bookcorpus": DatasetConfig(
+        path="/zirui/data/bookcorpus/bookcorpus_megatron.json",
+        loader=lambda path: load_dataset("json", data_files=path, split="train"),
+        sample_processor=_process_c4_text,
+    ),
 }
 
 
