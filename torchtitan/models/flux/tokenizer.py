@@ -16,6 +16,27 @@ from transformers import CLIPTokenizer, T5Tokenizer
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 
 
+class NullTokenizer(BaseTokenizer):
+    """Tokenizer placeholder for recipes that consume precomputed encodings."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseTokenizer.Config):
+        max_t5_encoding_len: int = 256
+        """Text sequence length used to size Flux sequence length metadata."""
+
+    def __init__(self, config: Config, **kwargs):
+        super().__init__()
+
+    def encode(self, *args, **kwargs):
+        raise RuntimeError("NullTokenizer does not support encode().")
+
+    def decode(self, *args, **kwargs):
+        raise RuntimeError("NullTokenizer does not support decode().")
+
+    def get_vocab_size(self) -> int:
+        return 0
+
+
 class FluxTokenizerContainer(BaseTokenizer):
     """Container holding both T5 and CLIP tokenizers for Flux.
 

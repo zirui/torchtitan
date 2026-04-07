@@ -22,8 +22,8 @@ def preprocess_data(
     *,
     # arguments from the config
     autoencoder: AutoEncoder | None,
-    clip_encoder: FluxEmbedder,
-    t5_encoder: FluxEmbedder,
+    clip_encoder: FluxEmbedder | None,
+    t5_encoder: FluxEmbedder | None,
     batch: dict[str, Tensor],
 ) -> dict[str, Tensor]:
     """
@@ -40,6 +40,12 @@ def preprocess_data(
     Returns:
         dict[str, Tensor]: batch of preprocessed data
     """
+
+    if clip_encoder is None or t5_encoder is None:
+        raise ValueError("Flux text encoders must be loaded for online preprocessing.")
+
+    if "image" in batch and autoencoder is None:
+        raise ValueError("Flux autoencoder must be loaded for image preprocessing.")
 
     clip_tokens = batch["clip"].squeeze(1).to(device=device, dtype=torch.int)
     t5_tokens = batch["t5"].squeeze(1).to(device=device, dtype=torch.int)

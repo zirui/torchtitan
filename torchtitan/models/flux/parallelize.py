@@ -205,13 +205,13 @@ def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
 
 
 def parallelize_encoders(
-    t5_model: nn.Module,
-    clip_model: nn.Module,
+    t5_model: nn.Module | None,
+    clip_model: nn.Module | None,
     parallel_dims: ParallelDims,
     *,
     training: TrainingConfig,
 ):
-    if parallel_dims.dp_shard_enabled:  # apply FSDP or HSDP
+    if parallel_dims.dp_shard_enabled and t5_model is not None:  # apply FSDP or HSDP
         names = (
             ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         )

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 
@@ -22,9 +23,10 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.tools.logging import logger
 
 from .configs import SamplingConfig
-from .flux_datasets import FluxDataLoader
+from .flux_datasets import FluxDataLoader, PRECOMPUTED_DATASETS
 from .inference.sampling import generate_image, save_image
 from .model.autoencoder import AutoEncoder
+from .model.autoencoder_utils import generate_unscaled_latent_from_mean_logvar
 from .model.hf_embedder import FluxEmbedder
 from .tokenizer import FluxTokenizerContainer
 from .utils import create_position_encoding_for_latents, pack_latents, preprocess_data
@@ -96,7 +98,8 @@ class FluxValidator(Validator):
         self.all_timesteps = config.all_timesteps
 
         assert isinstance(config.dataloader, FluxDataLoader.Config)
-        assert isinstance(tokenizer, FluxTokenizerContainer)
+        if config.dataloader.dataset not in PRECOMPUTED_DATASETS:
+            assert isinstance(tokenizer, FluxTokenizerContainer)
 
         self.dl_config = replace(
             config.dataloader,
@@ -110,6 +113,7 @@ class FluxValidator(Validator):
         self.maybe_enable_amp = maybe_enable_amp
         # pyrefly: ignore [bad-assignment]
         self.metrics_processor = metrics_processor
+        self.last_loss: float | None = None
 
         if config.steps == -1:
             logger.warning(
@@ -121,9 +125,11 @@ class FluxValidator(Validator):
         self,
         device: torch.device,
         _dtype: torch.dtype,
-        autoencoder: AutoEncoder,
-        t5_encoder: FluxEmbedder,
-        clip_encoder: FluxEmbedder,
+        autoencoder: AutoEncoder | None,
+        t5_encoder: FluxEmbedder | None,
+        clip_encoder: FluxEmbedder | None,
+        autoencoder_shift_factor: float,
+        autoencoder_scale_factor: float,
         dump_folder: str,
     ):
         # pyrefly: ignore [read-only]
@@ -132,13 +138,52 @@ class FluxValidator(Validator):
         self.autoencoder = autoencoder
         self.t5_encoder = t5_encoder
         self.clip_encoder = clip_encoder
+        self.autoencoder_shift_factor = autoencoder_shift_factor
+        self.autoencoder_scale_factor = autoencoder_scale_factor
         self.dump_folder = dump_folder
+
+    def _prepare_flux_batch(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor | list[torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        if isinstance(labels, list):
+            mean, logvar = labels
+            mean = mean.to(device=self.device, dtype=self._dtype)
+            logvar = logvar.to(device=self.device, dtype=self._dtype)
+            input_dict["t5_encodings"] = input_dict["t5_encodings"].to(
+                device=self.device, dtype=self._dtype
+            )
+            input_dict["clip_encodings"] = input_dict["clip_encodings"].to(
+                device=self.device, dtype=self._dtype
+            )
+            if input_dict.pop("drop_encodings", None) is not None:
+                raise ValueError(
+                    "Validation expects precomputed Flux batches without encoding dropout."
+                )
+            labels = (
+                generate_unscaled_latent_from_mean_logvar(mean, logvar)
+                - self.autoencoder_shift_factor
+            ) * self.autoencoder_scale_factor
+            return input_dict, labels
+
+        input_dict["image"] = labels
+        input_dict = preprocess_data(
+            device=self.device,
+            dtype=self._dtype,
+            autoencoder=self.autoencoder,
+            clip_encoder=self.clip_encoder,
+            t5_encoder=self.t5_encoder,
+            batch=input_dict,
+        )
+        return input_dict, input_dict["img_encodings"]
 
     @torch.no_grad()
     def validate(
         self,
         model_parts: list[nn.Module],
         step: int,
+        extra_metrics: dict[str, float] | Callable[[], dict[str, float]] | None = None,
     ) -> None:
         # Set model to eval mode
         # TODO: currently does not support pipeline parallelism
@@ -150,9 +195,11 @@ class FluxValidator(Validator):
 
         parallel_dims = self.parallel_dims
 
-        accumulated_losses = []
         device_type = dist_utils.device_type
         num_steps = 0
+        total_loss_sum = torch.tensor(0.0, device=device_type)
+        total_target_elements = torch.tensor(0, dtype=torch.int64, device=device_type)
+        self.last_loss = None
 
         validation_dataloader = self.dl_config.build(
             dp_world_size=self.dp_world_size,
@@ -165,57 +212,56 @@ class FluxValidator(Validator):
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            prompt = input_dict.pop("prompt")
-            if not isinstance(prompt, list):
-                prompt = [prompt]
-            for p in prompt:
-                assert isinstance(p, str), f"prompt must be a string, got {type(p)}"
-                if save_img_count != -1 and save_img_count <= 0:
-                    break
-                img_size = (
-                    self.config.dataloader.img_size  # pyrefly: ignore [missing-attribute]
-                )
-                image = generate_image(
-                    device=self.device,
-                    dtype=self._dtype,
-                    img_height=16 * (img_size // 16),
-                    img_width=16 * (img_size // 16),
-                    enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
-                    denoising_steps=self.config.sampling.denoising_steps,
-                    classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
-                    # pyrefly: ignore [bad-argument-type]
-                    model=model,
-                    prompt=p,
-                    autoencoder=self.autoencoder,
-                    # pyrefly: ignore [bad-argument-type]
-                    tokenizer=self.tokenizer,
-                    t5_encoder=self.t5_encoder,
-                    clip_encoder=self.clip_encoder,
-                )
+            prompt = input_dict.pop("prompt", None)
+            if (
+                prompt is not None
+                and self.autoencoder is not None
+                and self.t5_encoder is not None
+                and self.clip_encoder is not None
+            ):
+                if not isinstance(prompt, list):
+                    prompt = [prompt]
+                for p in prompt:
+                    assert isinstance(p, str), (
+                        f"prompt must be a string, got {type(p)}"
+                    )
+                    if save_img_count != -1 and save_img_count <= 0:
+                        break
+                    img_size = (
+                        self.config.dataloader.img_size  # pyrefly: ignore [missing-attribute]
+                    )
+                    image = generate_image(
+                        device=self.device,
+                        dtype=self._dtype,
+                        img_height=16 * (img_size // 16),
+                        img_width=16 * (img_size // 16),
+                        enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
+                        denoising_steps=self.config.sampling.denoising_steps,
+                        classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
+                        # pyrefly: ignore [bad-argument-type]
+                        model=model,
+                        prompt=p,
+                        autoencoder=self.autoencoder,
+                        # pyrefly: ignore [bad-argument-type]
+                        tokenizer=self.tokenizer,
+                        t5_encoder=self.t5_encoder,
+                        clip_encoder=self.clip_encoder,
+                    )
 
-                save_image(
-                    name=f"image_rank{str(torch.distributed.get_rank())}_{step}.png",
-                    output_dir=os.path.join(
-                        self.dump_folder,
-                        self.config.save_img_folder,
-                    ),
-                    x=image,
-                    add_sampling_metadata=True,
-                    prompt=p,
-                )
-                save_img_count -= 1
+                    save_image(
+                        name=f"image_rank{str(torch.distributed.get_rank())}_{step}.png",
+                        output_dir=os.path.join(
+                            self.dump_folder,
+                            self.config.save_img_folder,
+                        ),
+                        x=image,
+                        add_sampling_metadata=True,
+                        prompt=p,
+                    )
+                    save_img_count -= 1
 
-            # generate t5 and clip embeddings
-            input_dict["image"] = labels
-            input_dict = preprocess_data(
-                device=self.device,
-                dtype=self._dtype,
-                autoencoder=self.autoencoder,
-                clip_encoder=self.clip_encoder,
-                t5_encoder=self.t5_encoder,
-                batch=input_dict,
-            )
-            labels = input_dict["img_encodings"].to(device_type)
+            input_dict, labels = self._prepare_flux_batch(input_dict, labels)
+            labels = labels.to(device_type)
             clip_encodings = input_dict["clip_encodings"]
             t5_encodings = input_dict["t5_encodings"]
 
@@ -287,24 +333,31 @@ class FluxValidator(Validator):
                     )
 
                 loss = self.loss_fn(latent_noise_pred, target)
+                total_loss_sum += loss.detach()
+                total_target_elements += target.numel()
 
             del noise, target, latent_noise_pred, latents
 
-            accumulated_losses.append(loss.detach())
-
             num_steps += 1
 
-        # Compute average loss
-        loss = torch.sum(torch.stack(accumulated_losses))
-        loss /= num_steps
         if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_mean(
-                loss, parallel_dims.get_optional_mesh("loss")
-            )
+            loss_mesh = parallel_dims.get_optional_mesh("loss")
+            global_loss_sum = dist_utils.dist_sum(total_loss_sum, loss_mesh)
+            global_target_elements = dist_utils.dist_sum(total_target_elements, loss_mesh)
         else:
-            global_avg_loss = float(loss.item())
+            global_loss_sum = float(total_loss_sum.item())
+            global_target_elements = float(total_target_elements.item())
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        if global_target_elements == 0:
+            raise ValueError("Flux validation did not accumulate any targets.")
+
+        self.last_loss = float(global_loss_sum / global_target_elements)
+        resolved_extra_metrics = extra_metrics() if callable(extra_metrics) else extra_metrics
+        self.metrics_processor.log_validation(
+            loss=self.last_loss,
+            step=step,
+            extra_metrics=resolved_extra_metrics,
+        )
 
         # Set model back to train mode
         model.train()

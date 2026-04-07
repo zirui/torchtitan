@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import io
 import itertools
 import math
 from collections.abc import Callable
@@ -13,8 +14,9 @@ from typing import Any
 import numpy as np
 import PIL.Image
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from datasets.distributed import split_dataset_by_node
+from PIL import ImageFile
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
@@ -24,19 +26,24 @@ from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.tools.logging import logger
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 def _process_cc12m_image(
     img: PIL.Image.Image,
     output_size: int = 256,
+    skip_low_resolution: bool = True,
 ) -> torch.Tensor | None:
     """Process CC12M image to the desired size."""
 
     width, height = img.size
     # Skip low resolution images
-    if width < output_size or height < output_size:
+    if skip_low_resolution and (width < output_size or height < output_size):
         return None
 
-    if width >= height:
+    if width == output_size and height == output_size:
+        resized_img = img
+    elif width >= height:
         # resize height to be equal to output_size, then crop
         new_width, new_height = math.ceil(output_size / height * width), output_size
         img = img.resize((new_width, new_height))
@@ -89,7 +96,8 @@ def _cc12m_wds_data_processor(
         output_size: The output image size
 
     """
-    img = _process_cc12m_image(sample["jpg"], output_size=output_size)
+    img_key = "png" if "png" in sample else "jpg"
+    img = _process_cc12m_image(sample[img_key], output_size=output_size)
     tokens = tokenizer.encode(sample["txt"])
 
     return {
@@ -126,11 +134,70 @@ def _coco_data_processor(
     }
 
 
+def _deserialize_numpy_array(data: bytes) -> torch.Tensor:
+    buffer = io.BytesIO(data)
+    return torch.from_numpy(np.load(buffer)).view(torch.bfloat16)
+
+
+def _precomputed_data_processor(
+    sample: dict[str, Any],
+    tokenizer: FluxTokenizerContainer,
+    output_size: int = 256,
+) -> dict[str, Any]:
+    del tokenizer, output_size
+    sample_dict = dict(sample)
+    sample_dict["t5_encodings"] = _deserialize_numpy_array(sample_dict["t5_encodings"])
+    sample_dict["clip_encodings"] = _deserialize_numpy_array(
+        sample_dict["clip_encodings"]
+    )
+    sample_dict["mean"] = _deserialize_numpy_array(sample_dict["mean"])
+    sample_dict["logvar"] = _deserialize_numpy_array(sample_dict["logvar"])
+    return sample_dict
+
+
+def _coco_mlperf_data_processor(
+    sample: dict[str, Any],
+    tokenizer: FluxTokenizerContainer,
+    output_size: int = 256,
+) -> dict[str, Any]:
+    img_key = "png" if "png" in sample else "jpg"
+    img = _process_cc12m_image(
+        sample[img_key],
+        output_size=output_size,
+        skip_low_resolution=False,
+    )
+    prompt = sample["txt"]
+    tokens = tokenizer.encode(prompt)
+    metadata = sample["json"]
+    if not isinstance(metadata, dict):
+        raise ValueError("Expected parsed json metadata for coco-mlperf dataset")
+
+    sample_dict = {
+        "image": img,
+        **tokens,
+        "prompt": prompt,
+        "timestep": metadata["timestep"],
+    }
+    if "id" in metadata:
+        sample_dict["id"] = metadata["id"]
+    return sample_dict
+
+
 DATASETS = {
     "cc12m-wds": DatasetConfig(
         path="pixparse/cc12m-wds",
         loader=lambda path: load_dataset(path, split="train", streaming=True),
         sample_processor=_cc12m_wds_data_processor,
+    ),
+    "cc12m-disk": DatasetConfig(
+        path="/dataset/cc12m_disk",
+        loader=lambda path: load_from_disk(path),
+        sample_processor=_cc12m_wds_data_processor,
+    ),
+    "cc12m-preprocessed": DatasetConfig(
+        path="/dataset/cc12m_preprocessed",
+        loader=lambda path: load_from_disk(path),
+        sample_processor=_precomputed_data_processor,
     ),
     "cc12m-test": DatasetConfig(
         path="tests/assets/cc12m_test",
@@ -139,12 +206,29 @@ DATASETS = {
         ),
         sample_processor=_cc12m_wds_data_processor,
     ),
+    "coco-mlperf": DatasetConfig(
+        path="/dataset/coco",
+        loader=lambda path: load_dataset(
+            "webdataset",
+            split="train",
+            data_dir=path,
+            streaming=True,
+        ),
+        sample_processor=_coco_mlperf_data_processor,
+    ),
+    "coco-preprocessed": DatasetConfig(
+        path="/dataset/coco_preprocessed",
+        loader=lambda path: load_from_disk(path),
+        sample_processor=_precomputed_data_processor,
+    ),
     "coco-validation": DatasetConfig(
         path="howard-hou/COCO-Text",
         loader=lambda path: load_dataset(path, split="validation", streaming=True),
         sample_processor=_coco_data_processor,
     ),
 }
+
+PRECOMPUTED_DATASETS = {"cc12m-preprocessed", "coco-preprocessed"}
 
 
 def _validate_dataset(
@@ -179,7 +263,7 @@ class FluxDataset(IterableDataset, Stateful):
         self,
         dataset_name: str,
         dataset_path: str | None,
-        tokenizer: FluxTokenizerContainer,
+        tokenizer: FluxTokenizerContainer | None,
         prompt_dropout_prob: float,
         img_size: int,
         dp_rank: int = 0,
@@ -199,9 +283,13 @@ class FluxDataset(IterableDataset, Stateful):
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
 
         self._tokenizer = tokenizer
-        empty_tokens = tokenizer.encode("")
-        self._t5_empty_token = empty_tokens["t5"]
-        self._clip_empty_token = empty_tokens["clip"]
+        if isinstance(tokenizer, FluxTokenizerContainer):
+            empty_tokens = tokenizer.encode("")
+            self._t5_empty_token = empty_tokens["t5"]
+            self._clip_empty_token = empty_tokens["clip"]
+        else:
+            self._t5_empty_token = None
+            self._clip_empty_token = None
         self._data_processor = data_processor
         self.prompt_dropout_prob = prompt_dropout_prob
         self.img_size = img_size
@@ -259,7 +347,7 @@ class FluxDataset(IterableDataset, Stateful):
             )
 
             # skip low quality image or image with color channel = 1
-            if sample_dict["image"] is None:
+            if "image" in sample_dict and sample_dict["image"] is None:
                 # pyrefly: ignore [missing-attribute]
                 sample = sample.get("__key__", "unknown")
                 logger.warning(
@@ -272,14 +360,27 @@ class FluxDataset(IterableDataset, Stateful):
             # pyrefly: ignore [missing-attribute]
             dropout_prob = self.prompt_dropout_prob
             if dropout_prob > 0.0:
-                if torch.rand(1).item() < dropout_prob:
-                    sample_dict["t5"] = self._t5_empty_token
-                if torch.rand(1).item() < dropout_prob:
-                    sample_dict["clip"] = self._clip_empty_token
+                if "t5" in sample_dict:
+                    if self._t5_empty_token is None or self._clip_empty_token is None:
+                        raise ValueError(
+                            "Flux tokenizers must be available for token dropout."
+                        )
+                    if torch.rand(1).item() < dropout_prob:
+                        sample_dict["t5"] = self._t5_empty_token
+                    if torch.rand(1).item() < dropout_prob:
+                        sample_dict["clip"] = self._clip_empty_token
+                elif "t5_encodings" in sample_dict:
+                    sample_dict["drop_encodings"] = (
+                        torch.rand(1).item() < dropout_prob
+                    )
 
             self._sample_idx += 1
 
-            labels = sample_dict.pop("image")
+            labels = (
+                sample_dict.pop("image")
+                if "image" in sample_dict
+                else [sample_dict.pop("mean"), sample_dict.pop("logvar")]
+            )
 
             yield sample_dict, labels
 
@@ -309,7 +410,7 @@ class FluxValidationDataset(FluxDataset):
         self,
         dataset_name: str,
         dataset_path: str | None,
-        tokenizer: FluxTokenizerContainer,
+        tokenizer: FluxTokenizerContainer | None,
         prompt_dropout_prob: float,
         img_size: int,
         dp_rank: int = 0,
@@ -396,8 +497,12 @@ class FluxDataLoader(ParallelAwareDataloader):
         tokenizer: BaseTokenizer | None = None,
         **kwargs,
     ):
+        if config.dataset in PRECOMPUTED_DATASETS:
+            tokenizer = None
 
-        if not isinstance(tokenizer, FluxTokenizerContainer):
+        if config.dataset not in PRECOMPUTED_DATASETS and not isinstance(
+            tokenizer, FluxTokenizerContainer
+        ):
             raise ValueError(
                 "FluxDataLoader requires a FluxTokenizerContainer as tokenizer. "
                 "Set tokenizer=FluxTokenizerContainer.Config(...) in your trainer config."

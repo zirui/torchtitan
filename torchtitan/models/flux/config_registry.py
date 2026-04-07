@@ -15,9 +15,14 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.models.flux.configs import FluxEncoderConfig, Inference, SamplingConfig
+from torchtitan.models.flux.configs import (
+    FluxEncoderConfig,
+    FluxMLPerfConfig,
+    Inference,
+    SamplingConfig,
+)
 from torchtitan.models.flux.flux_datasets import FluxDataLoader
-from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
+from torchtitan.models.flux.tokenizer import FluxTokenizerContainer, NullTokenizer
 from torchtitan.models.flux.trainer import FluxTrainer
 from torchtitan.models.flux.validate import FluxValidator
 from torchtitan.protocols.model_converter import ModelConvertersContainer
@@ -187,6 +192,82 @@ def flux_schnell() -> FluxTrainer.Config:
             all_timesteps=False,
         ),
     )
+
+
+def flux_schnell_mlperf() -> FluxTrainer.Config:
+    """Flux schnell recipe aligned with the MLPerf data flow.
+
+    This keeps online encoders enabled while switching to the local MLPerf
+    datasets and enabling per-block ``torch.compile`` on the Flux transformer.
+    """
+    config = flux_schnell()
+    config.metrics.log_freq = 10
+    config.training.local_batch_size = 16
+    config.training.steps = 30_000
+    config.compile = CompileConfig(enable=True, components=["model"])
+    config.dataloader = FluxDataLoader.Config(
+        dataset="cc12m-disk",
+        prompt_dropout_prob=0.1,
+        img_size=256,
+    )
+    config.validator = FluxValidator.Config(
+        enable=True,
+        freq=config.validator.freq,
+        steps=-1,
+        sampling=config.validator.sampling,
+        dataloader=FluxDataLoader.Config(
+            dataset="coco-mlperf",
+            prompt_dropout_prob=0.0,
+            img_size=256,
+            generate_timesteps=False,
+            infinite=False,
+        ),
+        save_img_count=0,
+        save_img_folder="img",
+        all_timesteps=False,
+    )
+    config.mlperf = FluxMLPerfConfig(enable=True)
+    config.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=0,
+        decay_ratio=0.0,
+    )
+    return config
+
+
+def flux_schnell_mlperf_preprocessed() -> FluxTrainer.Config:
+    """Flux schnell MLPerf recipe using precomputed text/image encodings."""
+    config = flux_schnell_mlperf()
+    config.tokenizer = NullTokenizer.Config()
+    config.dataloader = FluxDataLoader.Config(
+        dataset="cc12m-preprocessed",
+        prompt_dropout_prob=0.1,
+        img_size=256,
+    )
+    config.validator = FluxValidator.Config(
+        enable=True,
+        freq=config.validator.freq,
+        steps=-1,
+        sampling=config.validator.sampling,
+        dataloader=FluxDataLoader.Config(
+            dataset="coco-preprocessed",
+            prompt_dropout_prob=0.0,
+            img_size=256,
+            generate_timesteps=False,
+            infinite=False,
+        ),
+        save_img_count=0,
+        save_img_folder="img",
+        all_timesteps=False,
+    )
+    config.encoder = FluxEncoderConfig(
+        t5_encoder=None,
+        clip_encoder=None,
+        autoencoder_path=None,
+        autoencoder_shift=0.1159,
+        autoencoder_scale=0.3611,
+        empty_encodings_path="/dataset/empty_encodings",
+    )
+    return config
 
 
 def flux_schnell_mxfp8() -> FluxTrainer.Config:

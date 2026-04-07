@@ -341,6 +341,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config.training.local_batch_size * batch_degree
         )
         assert self.gradient_accumulation_steps > 0
+        self.metrics_processor.local_batch_size = config.training.local_batch_size
+        self.metrics_processor.global_batch_size = global_batch_size
+        self.metrics_processor.data_parallel_degree = batch_degree
+        self.metrics_processor.gradient_accumulation_steps = (
+            self.gradient_accumulation_steps
+        )
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:

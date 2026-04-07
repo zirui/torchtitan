@@ -316,6 +316,11 @@ class MetricsProcessor(Configurable):
     optimizers: OptimizersContainer | None
     lr_schedulers: LRSchedulersContainer | None
     model_parts: list[torch.nn.Module] | None
+    local_batch_size: int | None
+    global_batch_size: int | None
+    data_parallel_degree: int | None
+    gradient_accumulation_steps: int | None
+    last_train_log_step: int | None
 
     def __init__(
         self,
@@ -361,6 +366,11 @@ class MetricsProcessor(Configurable):
         self.optimizers = None
         self.lr_schedulers = None
         self.model_parts = None
+        self.local_batch_size = None
+        self.global_batch_size = None
+        self.data_parallel_degree = None
+        self.gradient_accumulation_steps = None
+        self.last_train_log_step = None
 
     def should_log(self, step: int) -> bool:
         return step == 1 or step % self.config.log_freq == 0
@@ -475,6 +485,11 @@ class MetricsProcessor(Configurable):
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
         time_delta = time.perf_counter() - self.time_last_log
+        steps_since_last_log = (
+            1
+            if self.last_train_log_step is None
+            else max(1, step - self.last_train_log_step)
+        )
 
         # tokens per second per device, abbreviated as tps
         tps = self.ntokens_since_last_log / (
@@ -491,9 +506,29 @@ class MetricsProcessor(Configurable):
         else:
             mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
-        time_end_to_end = time_delta / self.config.log_freq
+        step_time = time_delta / steps_since_last_log
+        time_end_to_end = step_time
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
         time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
+        device_samples_per_second = None
+        global_samples_per_second = None
+        if self.local_batch_size is not None:
+            samples_per_device = self.local_batch_size * (
+                self.gradient_accumulation_steps or 1
+            )
+            device_samples_per_second = samples_per_device / step_time
+            if self.data_parallel_degree is not None:
+                global_samples_per_second = (
+                    device_samples_per_second * self.data_parallel_degree
+                )
+        elif self.global_batch_size is not None:
+            global_samples_per_second = (
+                self.global_batch_size * steps_since_last_log / time_delta
+            )
+            if self.data_parallel_degree is not None:
+                device_samples_per_second = (
+                    global_samples_per_second / self.data_parallel_degree
+                )
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
@@ -503,6 +538,7 @@ class MetricsProcessor(Configurable):
             "grad_norm": grad_norm,
             "throughput(tps)": tps,
             "tflops": tflops,
+            "time_metrics/step_time(s)": step_time,
             "time_metrics/end_to_end(s)": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
@@ -515,6 +551,10 @@ class MetricsProcessor(Configurable):
         }
         if mfu is not None:
             metrics["mfu(%)"] = mfu
+        if device_samples_per_second is not None:
+            metrics["throughput(device_samples/s)"] = device_samples_per_second
+        if global_samples_per_second is not None:
+            metrics["throughput(global_samples/s)"] = global_samples_per_second
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -523,6 +563,15 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        samples_str = ""
+        if (
+            device_samples_per_second is not None
+            and global_samples_per_second is not None
+        ):
+            samples_str = (
+                f"  {color.yellow}samples/s(device/global): "
+                f"{device_samples_per_second:,.1f}/{global_samples_per_second:,.1f}"
+            )
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -531,13 +580,16 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}"
+            f"{samples_str}  "
+            f"{color.white}step_time: {step_time:.2f}s{color.reset}"
         )
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
+        self.last_train_log_step = step
 
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None

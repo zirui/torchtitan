@@ -11,16 +11,55 @@ from dataclasses import dataclass, field
 class FluxEncoderConfig:
     """Configuration for Flux encoders (T5 text encoder, CLIP text encoder, and autoencoder)."""
 
-    t5_encoder: str = "google/t5-v1_1-small"
-    """HuggingFace model name or local path for the T5 text encoder."""
-    clip_encoder: str = "openai/clip-vit-large-patch14"
-    """HuggingFace model name or local path for the CLIP text encoder."""
-    autoencoder_path: str = (
+    t5_encoder: str | None = "google/t5-v1_1-small"
+    """HuggingFace model name or local path for the T5 text encoder.
+
+    Set to ``None`` to use precomputed T5 encodings from the dataset.
+    """
+
+    clip_encoder: str | None = "openai/clip-vit-large-patch14"
+    """HuggingFace model name or local path for the CLIP text encoder.
+
+    Set to ``None`` to use precomputed CLIP encodings from the dataset.
+    """
+
+    autoencoder_path: str | None = (
         "torchtitan/experiments/flux/assets/autoencoder/ae.safetensors"
     )
-    """Autoencoder checkpoint path to load. This should be a local path referring to a safetensors file."""
+    """Autoencoder checkpoint path to load.
+
+    Set to ``None`` to use precomputed latent statistics from the dataset.
+    """
+
+    autoencoder_shift: float | None = None
+    """Optional latent shift factor used when the autoencoder is not loaded."""
+
+    autoencoder_scale: float | None = None
+    """Optional latent scale factor used when the autoencoder is not loaded."""
+
+    empty_encodings_path: str | None = None
+    """Optional folder containing ``t5_empty.npy`` and ``clip_empty.npy``.
+
+    This is used by precomputed-encoding training recipes that still need
+    empty-condition embeddings for classifier-free guidance dropout.
+    """
+
     random_init: bool = False
     """If True, initialize encoders with random weights instead of loading pretrained weights (for testing only)."""
+
+
+@dataclass(kw_only=True, slots=True)
+class FluxMLPerfConfig:
+    """MLPerf-specific training controls for Flux recipes."""
+
+    enable: bool = False
+    """Enable MLPerf compliance logging and convergence-based early stop."""
+
+    target_eval_loss: float = 0.586
+    """Validation loss threshold used for MLPerf convergence."""
+
+    eval_samples: int = 262_144
+    """Number of training samples between MLPerf validation runs."""
 
 
 @dataclass(kw_only=True, slots=True)
