@@ -20,9 +20,6 @@ from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
-from torchtitan.hf_datasets.megatron_blended_datasets import (
-    build_megatron_blended_datasets,
-)
 from torchtitan.tools.logging import logger
 
 PYTHON_EDU_CONTENT_DIR = "/wekafs/hanwang2/python-edu"
@@ -449,6 +446,10 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         **kwargs,
     ):
         if config.dataset == "megatron":
+            from torchtitan.hf_datasets.megatron_blended_datasets import (
+                build_megatron_blended_datasets,
+            )
+
             assert config.dataset_path
             hf_ds = build_megatron_blended_datasets(
                 config.dataset_path,
